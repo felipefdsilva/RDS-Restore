@@ -2,11 +2,7 @@ import boto3
 import sys
 import json
 
-session = boto3.Session(
-	profile_name='poc-ipsense',
-	region_name='us-east-1'
-)
-client = session.client('rds')
+client = boto3.client('rds')
 
 snapshot_metadata = client.describe_db_snapshots(
     DBSnapshotIdentifier='my-teste-automation-snap01'
