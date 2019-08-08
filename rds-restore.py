@@ -1,17 +1,45 @@
 import boto3
 import json
 import sys
+from arnparse import arnparse
 
 class RDSCopyException (Exception):
     pass
 
-#Retrieves the rds snapshot list and return the latest one
-def get_latest_snapshot (rds_name):
+#Retrieves a client from the corresponding account
+def get_client (service, account_number, region):
 
-    rds = boto3.Session(profile_name='poc', region_name='us-east-1').client('rds')
+    ipsense_account_number = '025239092240'
+    role_session_name = 'ipsense-rds-restore'
+    role_name = 'multiview-ipsense'
+
+    if (account_number == ipsense_account_number):
+        return boto3.client(service, region_name=region)
+
+    #Getting credentials to assume role
+    account_credentials = boto3.client('sts').assume_role ( 
+        RoleArn = 'arn:aws:iam::{accountNumber}:role/{role}'.
+                    format(accountNumber=account_number, role=role_name),
+        RoleSessionName = role_session_name
+    )['Credentials']
+
+    #Instantiating client
+    external_client = boto3.client(service,
+        aws_access_key_id = account_credentials['AccessKeyId'], 
+        aws_secret_access_key = account_credentials['SecretAccessKey'], 
+        aws_session_token = account_credentials['SessionToken'],
+        region_name=region
+    )
+    return external_client
+
+#Retrieves the rds snapshot list and return the latest one
+def get_latest_snapshot (rds_arn):
+
+    arn = arnparse(rds_arn)
+    rds = get_client(arn.service, arn.account_id, arn.region)
 
     snapshot_list = rds.describe_db_snapshots(
-        DBInstanceIdentifier=rds_name
+        DBInstanceIdentifier=arn.resource
     )['DBSnapshots']
 
     if (len(snapshot_list) == 0):
@@ -21,50 +49,54 @@ def get_latest_snapshot (rds_name):
 
     return snapshot_list[-1]
 
-#Returns the description of a rds instance
-def get_rds_description (rds_name):
-
-    rds = boto3.Session(profile_name='poc', region_name='us-east-1').client('rds')
-
-    return rds.describe_db_instances(DBInstanceIdentifier=rds_name)['DBInstances'][0]
-
 #Return the tags of a RDS instance
 def get_tags (rds_arn):
 
-    rds = boto3.Session(profile_name='poc', region_name='us-east-1').client('rds')
+    arn = arnparse(rds_arn)
+    rds = get_client(arn.service, arn.account_id, arn.region)
 
-    tags = rds.list_tags_for_resource (ResourceName=rds_arn)['TagList']
+    return rds.list_tags_for_resource (ResourceName=rds_arn)['TagList']
 
-    return tags
+#Returns the description of a rds instance
+def get_rds_description (rds_arn):
+
+    arn = arnparse(rds_arn)
+    rds = get_client(arn.service, arn.account_id, arn.region)
+    
+    rds_description = rds.describe_db_instances(DBInstanceIdentifier=arn.resource)['DBInstances'][0]
+    rds_description['Tags'] = get_tags(rds_arn)
+
+    return rds_description
 
 #Deletes a RDS
-def delete_rds (rds_name):
+def delete_rds (rds_arn):
 
-    rds = boto3.Session(profile_name='poc', region_name='us-east-1').client('rds')
+    arn = arnparse(rds_arn)
+    rds = get_client(arn.service, arn.account_id, arn.region)
 
-    deleted_rds = rds.delete_db_instance (
-        DBInstanceIdentifier=rds_name,
+    rds.delete_db_instance (
+        DBInstanceIdentifier=arn.resource,
         SkipFinalSnapshot=True,
         DeleteAutomatedBackups=False
     )
-    rds.get_waiter('db_instance_deleted').wait(DBInstanceIdentifier=rds_name)
-
+    rds.get_waiter('db_instance_deleted').wait(DBInstanceIdentifier=arn.resource)
 
 #Creates a RDS from the latest snapshot
 def create_rds (snapshot_name, rds_description):
 
-    rds = boto3.Session(profile_name='poc', region_name='us-east-1').client('rds')
+    arn = arnparse(rds_description['DBInstanceArn'])
+    rds = get_client(arn.service, arn.account_id, arn.region)
 
     vpc_sec_groups_ids = []
 
     for sg in rds_description['VpcSecurityGroups']:
         vpc_sec_groups_ids.append(sg['VpcSecurityGroupId'])
 
-    new_rds = rds.restore_db_instance_from_db_snapshot(
+    rds.restore_db_instance_from_db_snapshot(
         DBInstanceIdentifier=rds_description['DBInstanceIdentifier'],
         DBSnapshotIdentifier=snapshot_name,
         DBInstanceClass=rds_description['DBInstanceClass'],
-        AvailabilityZone=rds_description['AvailabilityZone'],
+        #AvailabilityZone=rds_description['AvailabilityZone'], #se MultiAZ=True, gera erro
         DBSubnetGroupName=rds_description['DBSubnetGroup']['DBSubnetGroupName'],
         MultiAZ=rds_description['MultiAZ'],
         PubliclyAccessible=rds_description['PubliclyAccessible'],
@@ -78,28 +110,49 @@ def create_rds (snapshot_name, rds_description):
         EnableIAMDatabaseAuthentication=rds_description['IAMDatabaseAuthenticationEnabled'],
         DBParameterGroupName=rds_description['DBParameterGroups'][0]['DBParameterGroupName'],
         DeletionProtection=rds_description['DeletionProtection'],
-        Tags=get_tags(rds_description['DBInstanceArn'])
+        Tags=rds_description['Tags']
     )
-    return new_rds
+    #waiting deletion finalization
+    waiter = rds.get_waiter('db_instance_available')
+    waiter.wait(DBInstanceIdentifier=rds_description['DBInstanceIdentifier'])
 
-def main ():
-    rds_name = sys.argv[1]
+    return get_rds_description (rds_description['DBInstanceArn'])
+
+def main (event, context):
+    sns_topic_arn = 'arn:aws:sns:us-east-1:025239092240:ipsense-rds-restore-service'
+    parsed_sns_arn = arnparse(sns_topic_arn)
+    
+    prod_rds_arn = event['ProductionRDS']
+    dev_rds_arn = event['DevelopmentRDS']
 
     try:
-        snapshot = get_latest_snapshot(rds_name)
+        print ("Retrieving latest snapshot")
+        snapshot = get_latest_snapshot(prod_rds_arn)
+        print ("Selected Snapshot: {name}".format(name=snapshot['DBSnapshotIdentifier']))
 
     except RDSCopyException as e:
         print (e)
         exit(1)
 
-    rds_description = get_rds_description(rds_name)
+    print ("Saving database description")
+    rds_description = get_rds_description(dev_rds_arn)
+    
+    get_client(parsed_sns_arn.service, parsed_sns_arn.account_id, parsed_sns_arn.region).publish(
+        TopicArn=sns_topic_arn,
+        Message="The database below is being restored\n"\
+            + json.dumps(rds_description, indent=4, sort_keys=True, default=str)
+    )
 
-    delete_rds(rds_name)
+    print ("Deleting database")
+    delete_rds(dev_rds_arn)
 
+    print ("Creating database")
     new_rds = create_rds(snapshot['DBSnapshotIdentifier'], rds_description)
 
-    print ("New RDS")
+    print ("New database description")
     print (json.dumps(new_rds, default=str, indent=4, sort_keys=True))
 
-if (__name__ == '__main__'):
-    main()
+    get_client(parsed_sns_arn.service, parsed_sns_arn.account_id, parsed_sns_arn.region).publish(
+        TopicArn=sns_topic_arn,
+        Message="Lambda function ipsense-rds-restore has finished its job"
+    )
