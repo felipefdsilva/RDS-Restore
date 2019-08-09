@@ -1,3 +1,8 @@
+# Author: Felipe Ferreira da Silva
+# Date: 09/08/2019
+# Description: This function restores an RDS DB from an snapshot of a production database
+# THIS FUNCTION WORKS WITH BOTO 1.9.20x 
+
 import boto3
 import json
 import sys
@@ -122,6 +127,7 @@ def main (event, context):
     sns_topic_arn = 'arn:aws:sns:us-east-1:025239092240:ipsense-rds-restore-service'
     parsed_sns_arn = arnparse(sns_topic_arn)
     
+    #Getting parameters passed trough the event
     prod_rds_arn = event['ProductionRDS']
     dev_rds_arn = event['DevelopmentRDS']
 
